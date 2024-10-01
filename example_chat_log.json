@@ -1,0 +1,52 @@
+[
+    {
+        "type": "conversation",
+        "audio_modality_interaction": false,
+        "image_modality_interaction": true,
+        "title": "example text modality conversation containing image data",
+        "create_time": 1725043046.684184,
+        "messages": [
+            {
+                "role": "user",
+                "create_time": 1725043046.991506,
+                "text": "So this is some text I've entered.",
+                "includes_image_data": true
+            },
+            {
+                "role": "assistant",
+                "create_time": 1725043051.785645,
+                "text": "I see you've also uploaded several images.",
+                "model": "gpt-4o"
+            }
+        ]
+    },
+    {
+        "type": "conversation",
+        "audio_modality_interaction": true,
+        "title": "example voice modality",
+        "create_time": 1725043046.684184,
+        "messages": [
+            {
+                "role": "user",
+                "create_time": 1725043046.991506,
+                "text": "So this is some audio That's been transcribed.",
+                "includes_image_data": true
+            },
+            {
+                "role": "assistant",
+                "create_time": 1725043051.785645,
+                "text": "I see you've also uploaded several images.",
+                "model": "unknown"
+            },
+            {
+                "some malformed": "message"
+            }
+        ]
+    },
+    {
+        "some malformed": "conversation",
+        "malformed empty conversation object below": "True"
+    },
+    {
+    }
+]
