@@ -1,0 +1,21 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../chat_logs"
+		}
+	],
+	"settings": {
+		"inlineChat.mode": "live",
+		"inlineChat.finishOnType": false,
+		"git.alwaysSignOff": true,
+		"cursor.aipreview.enabled": true,
+		"cursor.chat.premiumChatAutoScrollWhenAtBottom": true,
+		"cursor.chat.showSuggestedFiles": true,
+		"cursor.cmdk.useThemedDiffBackground": true,
+		"cursor.chat.smoothStreaming": true,
+		"cursor.general.enableShadowWorkspace": true
+	}
+}

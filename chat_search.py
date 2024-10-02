@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel,
-    QLineEdit, QComboBox, QHBoxLayout, QMessageBox, QSpinBox, QCheckBox
+    QLineEdit, QComboBox, QHBoxLayout, QMessageBox, QSpinBox, QCheckBox, QScrollArea
 )
 from PyQt5.QtCore import Qt
 from sklearn.decomposition import LatentDirichletAllocation
@@ -13,10 +13,13 @@ from sklearn.feature_extraction.text import CountVectorizer
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import multiprocessing
 
 # Initialize NLTK's VADER
 import nltk
-nltk.download('vader_lexicon')
+
+# Download NLTK data
+nltk.download('vader_lexicon', quiet=True)
 
 class ConversationIndexer(QWidget):
     def __init__(self):
@@ -30,7 +33,15 @@ class ConversationIndexer(QWidget):
         self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.semantic_embeddings = None
 
+        # Create a multiprocessing pool
+        self.pool = multiprocessing.Pool(initializer=self._worker_init)
+
         self.initUI()
+
+    @staticmethod
+    def _worker_init():
+        global sentiment_analyzer
+        sentiment_analyzer = SentimentIntensityAnalyzer()
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -108,6 +119,7 @@ class ConversationIndexer(QWidget):
 
         # Search Results
         self.results_combo = QComboBox()
+        self.results_combo.currentIndexChanged.connect(self.display_conversation)  # Connect signal to slot
         layout.addWidget(QLabel("Search Results:"))
         layout.addWidget(self.results_combo)
 
@@ -152,26 +164,49 @@ class ConversationIndexer(QWidget):
             QMessageBox.warning(self, "No Data", "Please load JSON files first.")
             return
 
-        # Topic Modeling
+        # Prepare the data to be passed to the worker function
+        data_dict = self.data.to_dict('records')
         num_topics = self.topic_spin.value() if not self.topic_auto.isChecked() else self.auto_select_topics()
+        num_emotions = self.emotion_spin.value() if not self.emotion_auto.isChecked() else self.auto_select_emotions()
+
+        # Use the multiprocessing pool for heavy computations
+        results = self.pool.apply_async(self._process_data_worker, (data_dict, num_topics, num_emotions))
+
+        # Wait for the results
+        processed_data = results.get()
+
+        # Update the class attributes with the processed data
+        self.data = pd.DataFrame(processed_data['data'])
+        self.semantic_embeddings = processed_data['semantic_embeddings']
+
+        QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
+
+    @staticmethod
+    def _process_data_worker(data_dict, num_topics, num_emotions):
+        # This method will run in a separate process
+        data = pd.DataFrame(data_dict)
+
+        # Topic Modeling
         vectorizer = CountVectorizer(stop_words='english')
-        dtm = vectorizer.fit_transform(self.data['full_text'])
+        dtm = vectorizer.fit_transform(data['full_text'])
         lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
         lda.fit(dtm)
         topics = lda.transform(dtm)
         topic_labels = [f"Topic {i}" for i in range(num_topics)]
         for i in range(num_topics):
-            self.data[topic_labels[i]] = topics[:, i]
+            data[topic_labels[i]] = topics[:, i]
 
-        # Emotion Analysis
-        emotions = self.analyze_emotions(self.data['full_text'], num_emotions=self.emotion_spin.value() if not self.emotion_auto.isChecked() else self.auto_select_emotions())
+        emotions = ConversationIndexer.analyze_emotions(data['full_text'], sentiment_analyzer, num_emotions)
         for emotion in emotions:
-            self.data[emotion] = emotions[emotion]
+            data[emotion] = emotions[emotion]
 
-        # Semantic Embeddings
-        self.semantic_embeddings = self.semantic_model.encode(self.data['full_text'].tolist(), convert_to_numpy=True)
+        semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+        semantic_embeddings = semantic_model.encode(data['full_text'].tolist(), convert_to_numpy=True)
 
-        QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
+        return {
+            'data': data.to_dict('records'),
+            'semantic_embeddings': semantic_embeddings
+        }
 
     def auto_select_topics(self):
         # Placeholder for automatic topic selection logic (e.g., coherence scores)
@@ -181,26 +216,16 @@ class ConversationIndexer(QWidget):
         # Placeholder for automatic emotion category selection
         return 5  # Default value
 
-    def analyze_emotions(self, texts, num_emotions=5):
+    @staticmethod
+    def analyze_emotions(texts, sentiment_analyzer, num_emotions=5):
         # Simple sentiment analysis using VADER
-        # For multiple emotions, you might need a more sophisticated model
-        emotions = {'positive': 0, 'negative': 0, 'neutral': 0}
-        emotion_data = {'positive': [], 'negative': [], 'neutral': []}
-
+        emotions = {'positive': [], 'negative': [], 'neutral': []}
         for text in texts:
-            scores = self.sentiment_analyzer.polarity_scores(text)
-            if scores['compound'] >= 0.05:
-                emotion = 'positive'
-            elif scores['compound'] <= -0.05:
-                emotion = 'negative'
-            else:
-                emotion = 'neutral'
-            emotion_data[emotion].append(1)
+            scores = sentiment_analyzer.polarity_scores(text)
+            emotion = 'positive' if scores['compound'] >= 0.05 else 'negative' if scores['compound'] <= -0.05 else 'neutral'
             for emo in emotions:
-                if emo != emotion:
-                    emotion_data[emo].append(0)
-
-        return emotion_data
+                emotions[emo].append(1 if emo == emotion else 0)
+        return emotions
 
     def search(self):
         query = self.search_input.text().strip()
@@ -211,18 +236,109 @@ class ConversationIndexer(QWidget):
         # Simple semantic search using cosine similarity
         query_embedding = self.semantic_model.encode([query], convert_to_numpy=True)
         similarities = np.dot(self.semantic_embeddings, query_embedding.T).squeeze()
-        top_indices = similarities.argsort()[-5:][::-1]  # Top 5 results
+        sorted_indices = similarities.argsort()[::-1]  # All results, sorted by similarity
 
-        self.results_combo.clear()
-        for idx in top_indices:
+        # Clear previous results
+        self.clear_results()
+
+        # Create a scroll area for results
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
+        for idx in sorted_indices:
             convo = self.data.iloc[idx]
             display_text = f"{convo['title']} (Created: {convo['create_time'].strftime('%Y-%m-%d')})"
-            self.results_combo.addItem(display_text)
+            result_button = QPushButton(display_text)
+            result_button.clicked.connect(lambda _, i=idx: self.display_conversation(i))
+            scroll_layout.addWidget(result_button)
 
-        QMessageBox.information(self, "Search Complete", "Top results have been populated.")
+        scroll_content.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_content)
+
+        # Add scroll area to the main layout
+        self.layout().addWidget(scroll_area)
+
+        QMessageBox.information(self, "Search Complete", "Results have been populated.")
+
+    def clear_results(self):
+        # Remove the previous scroll area if it exists
+        for i in reversed(range(self.layout().count())):
+            widget = self.layout().itemAt(i).widget()
+            if isinstance(widget, QScrollArea):
+                widget.setParent(None)
+
+    def display_conversation(self, index):
+        conversation = self.data.iloc[index]
+
+        # Create a new window to display the conversation
+        self.conversation_window = QWidget()
+        self.conversation_window.setWindowTitle(conversation['title'])
+        self.conversation_window.setGeometry(200, 200, 600, 400)
+
+        layout = QVBoxLayout()
+
+        # Create a scrollable text area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
+        # Define colors
+        marigold = "#FFA500"  # A warm yellow-orange
+        terra_cotta = "#E2725B"  # A reddish-orange
+        terra_verde = "#5F8575"  # A muted green
+        black = "#000000"
+
+        # Check if 'messages' exists in the conversation
+        if 'messages' in conversation:
+            for message in conversation['messages']:
+                if isinstance(message, dict) and 'text' in message:
+                    text = message['text']
+                    role = message.get('role', 'Unknown')
+
+                    message_label = QLabel(f"{role.capitalize()}: {text}")
+                    message_label.setWordWrap(True)
+
+                    if role.lower() == "assistant":
+                        message_label.setStyleSheet(
+                            f"background-color: {terra_verde}; color: {marigold}; border-radius: 10px; padding: 10px; margin: 5px;"
+                        )
+                    elif role.lower() == "user":
+                        message_label.setStyleSheet(
+                            f"background-color: {terra_cotta}; color: {marigold}; border-radius: 10px; padding: 10px; margin: 5px;"
+                        )
+
+                    scroll_content.setStyleSheet(
+                        f"background-color: 'navy blue'; color: 'navy blue'; border-radius: 10px; padding: 10px; margin: 5px;"
+                    )
+
+                    scroll_layout.addWidget(message_label)
+        else:
+            error_label = QLabel("No messages found in this conversation.")
+            error_label.setStyleSheet(f"color: {terra_cotta};")
+            scroll_layout.addWidget(error_label)
+
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area)
+
+        self.conversation_window.setLayout(layout)
+        self.conversation_window.show()
 
 if __name__ == '__main__':
+    # Use 'spawn' method for starting processes
+    multiprocessing.set_start_method('spawn')
+
     app = QApplication(sys.argv)
     window = ConversationIndexer()
     window.show()
-    sys.exit(app.exec_())
+
+    # Ensure proper cleanup when the application exits
+    try:
+        sys.exit(app.exec_())
+    finally:
+        # Perform any necessary cleanup here
+        if hasattr(window, 'pool'):
+            window.pool.close()
+            window.pool.join()
