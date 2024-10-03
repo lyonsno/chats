@@ -16,6 +16,8 @@
 		"cursor.chat.showSuggestedFiles": true,
 		"cursor.cmdk.useThemedDiffBackground": true,
 		"cursor.chat.smoothStreaming": true,
-		"cursor.general.enableShadowWorkspace": true
+		"cursor.general.enableShadowWorkspace": true,
+		"python.createEnvironment.contentButton": "show",
+		"editor.find.autoFindInSelection": "multiline",
 	}
 }

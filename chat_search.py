@@ -14,6 +14,17 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import multiprocessing
+from multiprocessing import Pool
+from functools import partial
+import pickle
+import atexit
+import hashlib
+import stat
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Initialize NLTK's VADER
 import nltk
@@ -24,6 +35,7 @@ nltk.download('vader_lexicon', quiet=True)
 class ConversationIndexer(QWidget):
     def __init__(self):
         super().__init__()
+        logger.info("Initializing ConversationIndexer")
         self.setWindowTitle("Conversation Indexer")
         self.setGeometry(100, 100, 800, 600)
         self.data = pd.DataFrame()
@@ -32,11 +44,75 @@ class ConversationIndexer(QWidget):
         self.sentiment_analyzer = SentimentIntensityAnalyzer()
         self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.semantic_embeddings = None
+        self.use_cache = True
 
-        # Create a multiprocessing pool
-        self.pool = multiprocessing.Pool(initializer=self._worker_init)
+        # Initialize the pool in the constructor
+        self.pool = None
+        self.initialize_pool()
+        atexit.register(self.cleanup_pool)
+
+        self.loaded_files = {}  # Change this to a dictionary
+
+        self.cache_dir = self.get_cache_dir()
 
         self.initUI()
+
+    def get_cache_dir(self):
+        logger.debug("Getting cache directory")
+        # Check for a custom cache directory in a config file or environment variable
+        custom_cache_dir = os.environ.get('CHAT_SEARCH_CACHE_DIR')
+        if custom_cache_dir:
+            cache_dir = custom_cache_dir
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".chat_search_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Using cache directory: {cache_dir}")
+        return cache_dir
+
+    def initialize_pool(self):
+        logger.info("Initializing process pool")
+        if self.pool is not None:
+            logger.debug("Cleaning up existing pool before initialization")
+            self.cleanup_pool()
+        try:
+            self.pool = Pool(initializer=self._worker_init)
+            logger.info("Process pool initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize process pool: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to initialize process pool: {str(e)}")
+            self.pool = None
+
+    def cleanup_pool(self):
+        logger.info("Cleaning up process pool")
+        if self.pool:
+            try:
+                logger.debug("Closing pool")
+                self.pool.close()
+                logger.debug("Joining pool with 10 seconds timeout")
+                start_time = time.time()
+                self.pool.join(timeout=10)
+                end_time = time.time()
+                logger.debug(f"Pool join completed in {end_time - start_time:.2f} seconds")
+            except multiprocessing.TimeoutError:
+                logger.warning("Pool join timed out after 10 seconds")
+            except Exception as e:
+                logger.error(f"Error while closing pool gracefully: {str(e)}", exc_info=True)
+            finally:
+                if self.pool:
+                    logger.warning("Terminating pool forcefully")
+                    self.pool.terminate()
+                    logger.debug("Pool terminated")
+                self.pool = None
+                logger.info("Pool cleanup completed")
+
+    def closeEvent(self, event):
+        logger.info("Close event triggered")
+        if self.pool:  # Only cleanup if pool exists
+            start_time = time.time()
+            self.cleanup_pool()
+            end_time = time.time()
+            logger.info(f"Total cleanup time: {end_time - start_time:.2f} seconds")
+        event.accept()
 
     @staticmethod
     def _worker_init():
@@ -117,11 +193,19 @@ class ConversationIndexer(QWidget):
         search_layout.addWidget(self.search_button)
         layout.addLayout(search_layout)
 
-        # Search Results
-        self.results_combo = QComboBox()
-        self.results_combo.currentIndexChanged.connect(self.display_conversation)  # Connect signal to slot
-        layout.addWidget(QLabel("Search Results:"))
-        layout.addWidget(self.results_combo)
+        # Results Area
+        self.results_area = QScrollArea()
+        self.results_area.setWidgetResizable(True)
+        self.results_content = QWidget()
+        self.results_layout = QVBoxLayout(self.results_content)
+        self.results_area.setWidget(self.results_content)
+        layout.addWidget(self.results_area)
+
+        # Cache Usage Checkbox
+        self.cache_checkbox = QCheckBox("Use Cache")
+        self.cache_checkbox.setChecked(True)
+        self.cache_checkbox.stateChanged.connect(self.toggle_cache_usage)
+        layout.addWidget(self.cache_checkbox)
 
         self.setLayout(layout)
 
@@ -131,82 +215,240 @@ class ConversationIndexer(QWidget):
     def toggle_emotion_spin(self, state):
         self.emotion_spin.setEnabled(not state)
 
+    def toggle_cache_usage(self, state):
+        self.use_cache = state == Qt.Checked
+
     def load_json(self):
+        logger.info("Loading JSON files")
         options = QFileDialog.Options()
         files, _ = QFileDialog.getOpenFileNames(self, "Load JSON Files", "",
                                                 "JSON Files (*.json);;All Files (*)", options=options)
         if files:
             all_data = []
             for file in files:
+                logger.debug(f"Processing file: {file}")
+                file_hash = self.calculate_file_hash(file)
+                if file in self.loaded_files and self.loaded_files[file] == file_hash:
+                    logger.info(f"File {file} already loaded and unchanged. Skipping.")
+                    continue
                 try:
-                    with open(file, 'r', encoding='utf-8') as f:
-                        json_data = json.load(f)
-                        for convo in json_data:
-                            record = {
-                                "type": convo.get("type", ""),
-                                "audio_modality_interaction": convo.get("audio_modality_interaction", False),
-                                "image_modality_interaction": convo.get("image_modality_interaction", False),
-                                "title": convo.get("title", ""),
-                                "create_time": datetime.fromtimestamp(convo.get("create_time", 0)),
-                                "messages": convo.get("messages", [])
-                            }
-                            # Concatenate all message texts
-                            texts = " ".join([msg.get("text", "") for msg in record["messages"]])
-                            record["full_text"] = texts
-                            all_data.append(record)
+                    file_data = self.load_or_process_file(file)
+                    all_data.extend(file_data)
+                    self.loaded_files[file] = file_hash
+                    logger.info(f"Successfully processed {len(file_data)} conversations from {file}")
                 except Exception as e:
-                    QMessageBox.warning(self, "Error", f"Failed to load {file}: {str(e)}")
-            self.data = pd.DataFrame(all_data)
-            QMessageBox.information(self, "Success", f"Loaded {len(self.data)} conversations.")
+                    logger.error(f"Error processing file {file}: {str(e)}", exc_info=True)
+                    QMessageBox.warning(self, "Error", f"Failed to process {file}: {str(e)}")
+
+            if all_data:
+                self.data = pd.DataFrame(all_data)
+                logger.debug("Sorting data by create_time")
+                self.data.sort_values('create_time', ascending=False, inplace=True)
+                logger.debug("Dropping duplicates based on conversation_id")
+                original_len = len(self.data)
+                self.data.drop_duplicates(subset=['conversation_id'], keep='first', inplace=True)
+                logger.info(f"Removed {original_len - len(self.data)} duplicate conversations")
+                QMessageBox.information(self, "Success", f"Loaded {len(self.data)} unique conversations from {len(files)} files.")
+                self.display_all_conversations()
+            else:
+                logger.warning("No valid conversations were loaded")
+                QMessageBox.warning(self, "No Data", "No valid conversations were loaded.")
+
+    def load_or_process_file(self, file):
+        logger.debug(f"Loading or processing file: {file}")
+        file_content_hash = self.calculate_file_hash(file)
+        stable_id = self.get_stable_file_id(file)
+        file_mod_time = os.path.getmtime(file)  # Get the file's modification time
+        cache_key = f"{file_content_hash}_{stable_id}_{file_mod_time}"
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.chatlog_cache")
+
+        file_data = []
+
+        if self.use_cache and os.path.exists(cache_file):
+            logger.debug(f"Attempting to load from cache: {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                if self.validate_cache(cached_data, file, file_content_hash):
+                    file_data = cached_data['data']
+                    logger.info(f"Loaded {len(file_data)} conversations from cache for {file}")
+                else:
+                    logger.warning(f"Cache file {cache_file} is invalid or outdated")
+            except Exception as e:
+                logger.error(f"Error loading cache file {cache_file}: {str(e)}", exc_info=True)
+
+        if not file_data:
+            logger.info(f"Processing JSON file: {file}")
+            try:
+                with open(file, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                file_data = self.process_json_data(json_data, file)
+                logger.info(f"Processed {len(file_data)} conversations from {file}")
+
+                if self.use_cache:
+                    logger.debug(f"Updating cache file: {cache_file}")
+                    cache_content = {
+                        'data': file_data,
+                        'file_hash': file_content_hash,
+                        'stable_id': stable_id,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cache_content, f)
+                    logger.info(f"Updated cache file {cache_file} with {len(file_data)} conversations")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error in file {file}: {str(e)}", exc_info=True)
+                raise ValueError(f"Invalid JSON in file {file}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error processing file {file}: {str(e)}", exc_info=True)
+                raise
+
+        return file_data
+
+    def get_stable_file_id(self, file_path):
+        """Get a stable identifier for the file."""
+        try:
+            # On Unix-like systems, use inode number
+            return os.stat(file_path).st_ino
+        except AttributeError:
+            # On Windows, use file index (similar to inode)
+            file_index = os.stat(file_path).st_file_attributes
+            return f"{file_index}"
+
+    def validate_cache(self, cached_data, source_file, current_file_hash):
+        """Validate the cache content."""
+        if not isinstance(cached_data, dict):
+            return False
+        required_keys = {'file_hash', 'data', 'timestamp', 'stable_id'}
+        if not all(key in cached_data for key in required_keys):
+            return False
+        if cached_data['file_hash'] != current_file_hash:
+            return False
+        if cached_data['stable_id'] != self.get_stable_file_id(source_file):
+            return False
+        if not isinstance(cached_data['data'], list) or not cached_data['data']:
+            return False
+        required_data_keys = {"type", "audio_modality_interaction", "image_modality_interaction",
+                              "title", "create_time", "messages", "full_text", "source_file", "conversation_id"}
+        return all(isinstance(item, dict) and required_data_keys.issubset(item.keys()) for item in cached_data['data'])
+
+    def calculate_file_hash(self, file_path):
+        """Calculate SHA256 hash of a file."""
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+
+    def process_json_data(self, json_data, source_file):
+        processed_data = []
+        for convo in json_data:
+            record = {
+                "type": convo.get("type", ""),
+                "audio_modality_interaction": convo.get("audio_modality_interaction", False),
+                "image_modality_interaction": convo.get("image_modality_interaction", False),
+                "title": convo.get("title", ""),
+                "create_time": datetime.fromtimestamp(convo.get("create_time", 0)),
+                "messages": convo.get("messages", []),
+                "source_file": source_file,
+                "conversation_id": self.generate_conversation_id(convo)
+            }
+            texts = " ".join([msg.get("text", "") for msg in record["messages"]])
+            record["full_text"] = texts
+            processed_data.append(record)
+        return processed_data
+
+    def generate_conversation_id(self, convo):
+        # Create a unique ID based only on conversation content
+        convo_content = json.dumps(convo, sort_keys=True).encode('utf-8')
+        return hashlib.md5(convo_content).hexdigest()
 
     def process_data(self):
+        logger.info("Starting data processing")
         if self.data.empty:
+            logger.warning("No data to process")
             QMessageBox.warning(self, "No Data", "Please load JSON files first.")
             return
 
-        # Prepare the data to be passed to the worker function
+        if not self.pool:
+            logger.debug("Process pool not initialized, attempting to initialize")
+            self.initialize_pool()
+            if not self.pool:
+                logger.error("Failed to initialize process pool")
+                QMessageBox.critical(self, "Error", "Failed to initialize process pool.")
+                return
+
         data_dict = self.data.to_dict('records')
         num_topics = self.topic_spin.value() if not self.topic_auto.isChecked() else self.auto_select_topics()
         num_emotions = self.emotion_spin.value() if not self.emotion_auto.isChecked() else self.auto_select_emotions()
 
-        # Use the multiprocessing pool for heavy computations
-        results = self.pool.apply_async(self._process_data_worker, (data_dict, num_topics, num_emotions))
+        logger.debug(f"Processing data with {num_topics} topics and {num_emotions} emotions")
 
-        # Wait for the results
-        processed_data = results.get()
+        try:
+            logger.debug("Applying async process to worker")
+            results = self.pool.apply_async(self._process_data_worker, (data_dict, num_topics, num_emotions))
+            logger.debug("Waiting for results (timeout: 300 seconds)")
+            processed_data = results.get(timeout=300)  # 5 minutes timeout
 
-        # Update the class attributes with the processed data
-        self.data = pd.DataFrame(processed_data['data'])
-        self.semantic_embeddings = processed_data['semantic_embeddings']
+            logger.info("Data processing completed successfully")
+            self.data = pd.DataFrame(processed_data['data'])
+            self.semantic_embeddings = processed_data['semantic_embeddings']
 
-        QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
+            QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
+            self.display_all_conversations()
+        except multiprocessing.TimeoutError:
+            logger.error("Data processing timed out after 5 minutes")
+            QMessageBox.critical(self, "Error", "Processing timed out after 5 minutes.")
+        except ValueError as ve:
+            if "Pool not running" in str(ve):
+                logger.error("Process pool not running, attempting to reinitialize")
+                QMessageBox.critical(self, "Error", "The process pool is not running. Trying to reinitialize...")
+                self.cleanup_pool()
+                self.initialize_pool()
+            else:
+                logger.error(f"ValueError during processing: {str(ve)}", exc_info=True)
+                QMessageBox.critical(self, "Error", f"An error occurred during processing: {str(ve)}")
+        except Exception as e:
+            logger.error(f"Unexpected error during processing: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred during processing: {str(e)}")
+        finally:
+            if not self.pool:
+                logger.debug("Reinitializing pool after processing")
+                self.initialize_pool()
 
     @staticmethod
     def _process_data_worker(data_dict, num_topics, num_emotions):
-        # This method will run in a separate process
+        logger.info(f"Worker process started with {num_topics} topics and {num_emotions} emotions")
         data = pd.DataFrame(data_dict)
 
-        # Topic Modeling
-        vectorizer = CountVectorizer(stop_words='english')
-        dtm = vectorizer.fit_transform(data['full_text'])
-        lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
-        lda.fit(dtm)
-        topics = lda.transform(dtm)
-        topic_labels = [f"Topic {i}" for i in range(num_topics)]
-        for i in range(num_topics):
-            data[topic_labels[i]] = topics[:, i]
+        try:
+            logger.debug("Performing topic modeling")
+            vectorizer = CountVectorizer(stop_words='english')
+            dtm = vectorizer.fit_transform(data['full_text'])
+            lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
+            lda.fit(dtm)
+            topics = lda.transform(dtm)
+            topic_labels = [f"Topic {i}" for i in range(num_topics)]
+            for i in range(num_topics):
+                data[topic_labels[i]] = topics[:, i]
 
-        emotions = ConversationIndexer.analyze_emotions(data['full_text'], sentiment_analyzer, num_emotions)
-        for emotion in emotions:
-            data[emotion] = emotions[emotion]
+            logger.debug("Analyzing emotions")
+            emotions = ConversationIndexer.analyze_emotions(data['full_text'], sentiment_analyzer, num_emotions)
+            for emotion in emotions:
+                data[emotion] = emotions[emotion]
 
-        semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-        semantic_embeddings = semantic_model.encode(data['full_text'].tolist(), convert_to_numpy=True)
+            logger.debug("Generating semantic embeddings")
+            semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+            semantic_embeddings = semantic_model.encode(data['full_text'].tolist(), convert_to_numpy=True)
 
-        return {
-            'data': data.to_dict('records'),
-            'semantic_embeddings': semantic_embeddings
-        }
+            logger.info("Worker process completed successfully")
+            return {
+                'data': data.to_dict('records'),
+                'semantic_embeddings': semantic_embeddings
+            }
+        except Exception as e:
+            logger.error(f"Error in worker process: {str(e)}", exc_info=True)
+            raise
 
     def auto_select_topics(self):
         # Placeholder for automatic topic selection logic (e.g., coherence scores)
@@ -230,7 +472,7 @@ class ConversationIndexer(QWidget):
     def search(self):
         query = self.search_input.text().strip()
         if not query:
-            QMessageBox.warning(self, "Empty Query", "Please enter a search query.")
+            self.display_all_conversations()
             return
 
         # Simple semantic search using cosine similarity
@@ -238,36 +480,30 @@ class ConversationIndexer(QWidget):
         similarities = np.dot(self.semantic_embeddings, query_embedding.T).squeeze()
         sorted_indices = similarities.argsort()[::-1]  # All results, sorted by similarity
 
-        # Clear previous results
+        self.display_filtered_conversations(sorted_indices)
+
+    def display_all_conversations(self):
         self.clear_results()
+        for idx in range(len(self.data)):
+            self.add_conversation_button(idx)
 
-        # Create a scroll area for results
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-
-        for idx in sorted_indices:
-            convo = self.data.iloc[idx]
-            display_text = f"{convo['title']} (Created: {convo['create_time'].strftime('%Y-%m-%d')})"
-            result_button = QPushButton(display_text)
-            result_button.clicked.connect(lambda _, i=idx: self.display_conversation(i))
-            scroll_layout.addWidget(result_button)
-
-        scroll_content.setLayout(scroll_layout)
-        scroll_area.setWidget(scroll_content)
-
-        # Add scroll area to the main layout
-        self.layout().addWidget(scroll_area)
-
-        QMessageBox.information(self, "Search Complete", "Results have been populated.")
+    def display_filtered_conversations(self, indices):
+        self.clear_results()
+        for idx in indices:
+            self.add_conversation_button(idx)
 
     def clear_results(self):
-        # Remove the previous scroll area if it exists
-        for i in reversed(range(self.layout().count())):
-            widget = self.layout().itemAt(i).widget()
-            if isinstance(widget, QScrollArea):
+        for i in reversed(range(self.results_layout.count())):
+            widget = self.results_layout.itemAt(i).widget()
+            if widget is not None:
                 widget.setParent(None)
+
+    def add_conversation_button(self, idx):
+        convo = self.data.iloc[idx]
+        display_text = f"{convo['title']} (Created: {convo['create_time'].strftime('%Y-%m-%d')})"
+        result_button = QPushButton(display_text)
+        result_button.clicked.connect(lambda _, i=idx: self.display_conversation(i))
+        self.results_layout.addWidget(result_button)
 
     def display_conversation(self, index):
         conversation = self.data.iloc[index]
@@ -327,18 +563,12 @@ class ConversationIndexer(QWidget):
         self.conversation_window.show()
 
 if __name__ == '__main__':
-    # Use 'spawn' method for starting processes
-    multiprocessing.set_start_method('spawn')
-
-    app = QApplication(sys.argv)
-    window = ConversationIndexer()
-    window.show()
-
-    # Ensure proper cleanup when the application exits
     try:
+        multiprocessing.set_start_method('spawn')
+        app = QApplication(sys.argv)
+        window = ConversationIndexer()
+        window.show()
         sys.exit(app.exec_())
-    finally:
-        # Perform any necessary cleanup here
-        if hasattr(window, 'pool'):
-            window.pool.close()
-            window.pool.join()
+    except Exception as e:
+        logger.critical(f"Critical error in main application: {str(e)}", exc_info=True)
+        QMessageBox.critical(None, "Critical Error", f"A critical error occurred: {str(e)}\nPlease check the log file for details.")
