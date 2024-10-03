@@ -7,20 +7,15 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel,
     QLineEdit, QComboBox, QHBoxLayout, QMessageBox, QSpinBox, QCheckBox, QScrollArea
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThreadPool, QRunnable, pyqtSignal, QObject
 from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.feature_extraction.text import CountVectorizer
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sentence_transformers import SentenceTransformer
 import numpy as np
-import multiprocessing
-from multiprocessing import Pool
-from functools import partial
-import pickle
-import atexit
 import hashlib
-import stat
 import logging
+import pickle
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,6 +26,26 @@ import nltk
 
 # Download NLTK data
 nltk.download('vader_lexicon', quiet=True)
+
+# Add this new class for our worker
+class Worker(QRunnable):
+    class Signals(QObject):
+        finished = pyqtSignal(object)
+        error = pyqtSignal(Exception)
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = Worker.Signals()
+
+    def run(self):
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+            self.signals.finished.emit(result)
+        except Exception as e:
+            self.signals.error.emit(e)
 
 class ConversationIndexer(QWidget):
     def __init__(self):
@@ -43,17 +58,15 @@ class ConversationIndexer(QWidget):
         self.vectorizer = None
         self.sentiment_analyzer = SentimentIntensityAnalyzer()
         self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.semantic_embeddings = None
+        self.semantic_embeddings = {}  # Change to a dictionary to store embeddings per file
         self.use_cache = True
-
-        # Initialize the pool in the constructor
-        self.pool = None
-        self.initialize_pool()
-        atexit.register(self.cleanup_pool)
 
         self.loaded_files = {}  # Change this to a dictionary
 
         self.cache_dir = self.get_cache_dir()
+
+        self.threadpool = QThreadPool()
+        logger.info(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
 
         self.initUI()
 
@@ -69,55 +82,9 @@ class ConversationIndexer(QWidget):
         logger.info(f"Using cache directory: {cache_dir}")
         return cache_dir
 
-    def initialize_pool(self):
-        logger.info("Initializing process pool")
-        if self.pool is not None:
-            logger.debug("Cleaning up existing pool before initialization")
-            self.cleanup_pool()
-        try:
-            self.pool = Pool(initializer=self._worker_init)
-            logger.info("Process pool initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize process pool: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to initialize process pool: {str(e)}")
-            self.pool = None
-
-    def cleanup_pool(self):
-        logger.info("Cleaning up process pool")
-        if self.pool:
-            try:
-                logger.debug("Closing pool")
-                self.pool.close()
-                logger.debug("Joining pool with 10 seconds timeout")
-                start_time = time.time()
-                self.pool.join(timeout=10)
-                end_time = time.time()
-                logger.debug(f"Pool join completed in {end_time - start_time:.2f} seconds")
-            except multiprocessing.TimeoutError:
-                logger.warning("Pool join timed out after 10 seconds")
-            except Exception as e:
-                logger.error(f"Error while closing pool gracefully: {str(e)}", exc_info=True)
-            finally:
-                if self.pool:
-                    logger.warning("Terminating pool forcefully")
-                    self.pool.terminate()
-                    logger.debug("Pool terminated")
-                self.pool = None
-                logger.info("Pool cleanup completed")
-
     def closeEvent(self, event):
         logger.info("Close event triggered")
-        if self.pool:  # Only cleanup if pool exists
-            start_time = time.time()
-            self.cleanup_pool()
-            end_time = time.time()
-            logger.info(f"Total cleanup time: {end_time - start_time:.2f} seconds")
         event.accept()
-
-    @staticmethod
-    def _worker_init():
-        global sentiment_analyzer
-        sentiment_analyzer = SentimentIntensityAnalyzer()
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -271,7 +238,9 @@ class ConversationIndexer(QWidget):
                     cached_data = pickle.load(f)
                 if self.validate_cache(cached_data, file, file_content_hash):
                     file_data = cached_data['data']
-                    logger.info(f"Loaded {len(file_data)} conversations from cache for {file}")
+                    if 'semantic_embeddings' in cached_data:
+                        self.semantic_embeddings = cached_data['semantic_embeddings']
+                    logger.info(f"Loaded {len(file_data)} conversations and semantic embeddings from cache for {file}")
                 else:
                     logger.warning(f"Cache file {cache_file} is invalid or outdated")
             except Exception as e:
@@ -291,11 +260,12 @@ class ConversationIndexer(QWidget):
                         'data': file_data,
                         'file_hash': file_content_hash,
                         'stable_id': stable_id,
-                        'timestamp': datetime.now().isoformat()
+                        'timestamp': datetime.now().isoformat(),
+                        'semantic_embeddings': self.semantic_embeddings.get(file)
                     }
                     with open(cache_file, 'wb') as f:
                         pickle.dump(cache_content, f)
-                    logger.info(f"Updated cache file {cache_file} with {len(file_data)} conversations")
+                    logger.info(f"Updated cache file {cache_file} with {len(file_data)} conversations and semantic embeddings")
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error in file {file}: {str(e)}", exc_info=True)
                 raise ValueError(f"Invalid JSON in file {file}: {str(e)}")
@@ -370,54 +340,52 @@ class ConversationIndexer(QWidget):
             QMessageBox.warning(self, "No Data", "Please load JSON files first.")
             return
 
-        if not self.pool:
-            logger.debug("Process pool not initialized, attempting to initialize")
-            self.initialize_pool()
-            if not self.pool:
-                logger.error("Failed to initialize process pool")
-                QMessageBox.critical(self, "Error", "Failed to initialize process pool.")
-                return
-
         data_dict = self.data.to_dict('records')
         num_topics = self.topic_spin.value() if not self.topic_auto.isChecked() else self.auto_select_topics()
         num_emotions = self.emotion_spin.value() if not self.emotion_auto.isChecked() else self.auto_select_emotions()
 
         logger.debug(f"Processing data with {num_topics} topics and {num_emotions} emotions")
 
-        try:
-            logger.debug("Applying async process to worker")
-            results = self.pool.apply_async(self._process_data_worker, (data_dict, num_topics, num_emotions))
-            logger.debug("Waiting for results (timeout: 300 seconds)")
-            processed_data = results.get(timeout=300)  # 5 minutes timeout
+        worker = Worker(self._process_data_worker, data_dict, num_topics, num_emotions, list(self.semantic_embeddings.values()))
+        worker.signals.finished.connect(self.process_complete)
+        worker.signals.error.connect(self.process_error)
 
-            logger.info("Data processing completed successfully")
-            self.data = pd.DataFrame(processed_data['data'])
-            self.semantic_embeddings = processed_data['semantic_embeddings']
+        self.threadpool.start(worker)
 
-            QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
-            self.display_all_conversations()
-        except multiprocessing.TimeoutError:
-            logger.error("Data processing timed out after 5 minutes")
-            QMessageBox.critical(self, "Error", "Processing timed out after 5 minutes.")
-        except ValueError as ve:
-            if "Pool not running" in str(ve):
-                logger.error("Process pool not running, attempting to reinitialize")
-                QMessageBox.critical(self, "Error", "The process pool is not running. Trying to reinitialize...")
-                self.cleanup_pool()
-                self.initialize_pool()
-            else:
-                logger.error(f"ValueError during processing: {str(ve)}", exc_info=True)
-                QMessageBox.critical(self, "Error", f"An error occurred during processing: {str(ve)}")
-        except Exception as e:
-            logger.error(f"Unexpected error during processing: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred during processing: {str(e)}")
-        finally:
-            if not self.pool:
-                logger.debug("Reinitializing pool after processing")
-                self.initialize_pool()
+    def process_complete(self, result):
+        logger.info("Data processing completed successfully")
+        self.data = pd.DataFrame(result['data'])
+        combined_embeddings = result['semantic_embeddings']
+
+        # Update the cache with the new semantic embeddings
+        if self.use_cache:
+            start_idx = 0
+            for file, file_hash in self.loaded_files.items():
+                stable_id = self.get_stable_file_id(file)
+                file_mod_time = os.path.getmtime(file)
+                cache_key = f"{file_hash}_{stable_id}_{file_mod_time}"
+                cache_file = os.path.join(self.cache_dir, f"{cache_key}.chatlog_cache")
+
+                if os.path.exists(cache_file):
+                    with open(cache_file, 'rb') as f:
+                        cached_data = pickle.load(f)
+                    file_data_length = len(cached_data['data'])
+                    cached_data['semantic_embeddings'] = combined_embeddings[start_idx:start_idx + file_data_length]
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cached_data, f)
+                    logger.info(f"Updated cache file {cache_file} with new semantic embeddings")
+                    start_idx += file_data_length
+
+        self.semantic_embeddings = combined_embeddings  # This is now a numpy array, not a dict
+        QMessageBox.information(self, "Processing Complete", "Data has been processed and indexed.")
+        self.display_all_conversations()
+
+    def process_error(self, error):
+        logger.error(f"Error during processing: {str(error)}", exc_info=True)
+        QMessageBox.critical(self, "Error", f"An error occurred during processing: {str(error)}")
 
     @staticmethod
-    def _process_data_worker(data_dict, num_topics, num_emotions):
+    def _process_data_worker(data_dict, num_topics, num_emotions, existing_embeddings):
         logger.info(f"Worker process started with {num_topics} topics and {num_emotions} emotions")
         data = pd.DataFrame(data_dict)
 
@@ -433,13 +401,20 @@ class ConversationIndexer(QWidget):
                 data[topic_labels[i]] = topics[:, i]
 
             logger.debug("Analyzing emotions")
+            sentiment_analyzer = SentimentIntensityAnalyzer()
             emotions = ConversationIndexer.analyze_emotions(data['full_text'], sentiment_analyzer, num_emotions)
             for emotion in emotions:
                 data[emotion] = emotions[emotion]
 
             logger.debug("Generating semantic embeddings")
             semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-            semantic_embeddings = semantic_model.encode(data['full_text'].tolist(), convert_to_numpy=True)
+            new_embeddings = semantic_model.encode(data['full_text'].tolist(), convert_to_numpy=True)
+
+            # Combine new embeddings with existing ones
+            if existing_embeddings:
+                semantic_embeddings = np.vstack([*existing_embeddings, new_embeddings])
+            else:
+                semantic_embeddings = new_embeddings
 
             logger.info("Worker process completed successfully")
             return {
@@ -473,6 +448,11 @@ class ConversationIndexer(QWidget):
         query = self.search_input.text().strip()
         if not query:
             self.display_all_conversations()
+            return
+
+        if self.semantic_embeddings is None or not isinstance(self.semantic_embeddings, np.ndarray):
+            logger.warning("Semantic embeddings not available or in incorrect format. Please process the data first.")
+            QMessageBox.warning(self, "Search Error", "Please process the data before searching.")
             return
 
         # Simple semantic search using cosine similarity
@@ -564,7 +544,6 @@ class ConversationIndexer(QWidget):
 
 if __name__ == '__main__':
     try:
-        multiprocessing.set_start_method('spawn')
         app = QApplication(sys.argv)
         window = ConversationIndexer()
         window.show()
